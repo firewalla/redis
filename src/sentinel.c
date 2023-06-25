@@ -81,10 +81,10 @@ typedef struct sentinelAddr {
 /* Note: times are in milliseconds. */
 #define SENTINEL_PING_PERIOD 1000
 
-static mstime_t sentinel_info_period = 10000;
+static mstime_t sentinel_info_period = 20000;
 static mstime_t sentinel_ping_period = SENTINEL_PING_PERIOD;
 static mstime_t sentinel_ask_period = 1000;
-static mstime_t sentinel_publish_period = 2000;
+static mstime_t sentinel_publish_period = 5000;
 static mstime_t sentinel_default_down_after = 30000;
 static mstime_t sentinel_tilt_trigger = 2000;
 static mstime_t sentinel_tilt_period = SENTINEL_PING_PERIOD * 30;
@@ -2514,7 +2514,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
     sds *lines;
     int numlines, j;
     int role = 0;
-
+    
     /* cache full INFO output for instance */
     sdsfree(ri->info);
     ri->info = sdsnew(info);
@@ -2771,7 +2771,6 @@ void sentinelInfoReplyCallback(redisAsyncContext *c, void *reply, void *privdata
     sentinelRedisInstance *ri = privdata;
     instanceLink *link = c->data;
     redisReply *r;
-
     if (!reply || !link) return;
     link->pending_commands--;
     r = reply;
@@ -2788,6 +2787,31 @@ void sentinelDiscardReplyCallback(redisAsyncContext *c, void *reply, void *privd
     UNUSED(privdata);
 
     if (link) link->pending_commands--;
+}
+
+/* handle MULTI info reply */
+void multiInfoReplyCallback(redisAsyncContext *c, void *reply, void *privdata) {
+    const size_t MAX_LEN = 2047;
+    char buf[MAX_LEN + 1];
+    buf[0] = '\0';
+    buf[MAX_LEN] = '\0';
+    size_t s = 0;
+    
+    //printf("%s\n", "handle multi info reply");
+    sentinelRedisInstance *ri = privdata;
+    instanceLink *link = c->data;
+    redisReply *r;
+    if (!reply || !link) return;
+    link->pending_commands--;
+    r = reply;
+
+    if (r->type == REDIS_REPLY_ARRAY) {
+        for (size_t j = 0; j < r->elements; j++) {
+            strncpy(buf + s, r->element[j]->str, MAX_LEN - s);
+            s = strlen(buf);
+        }
+        sentinelRefreshInstanceInfo(ri, buf);
+    }
 }
 
 void sentinelPingReplyCallback(redisAsyncContext *c, void *reply, void *privdata) {
@@ -3157,10 +3181,36 @@ void sentinelSendPeriodicCommands(sentinelRedisInstance *ri) {
         (ri->info_refresh == 0 ||
         (now - ri->info_refresh) > info_period))
     {
+        // retval = redisAsyncCommand(ri->link->cc,
+        //     sentinelInfoReplyCallback, ri, "%s",
+        //     sentinelInstanceMapCommand(ri,"INFO"));
+        // if (retval == C_ERR) return;
+        // ri->link->pending_commands++;
+
+        // use multi to reduce info response size
         retval = redisAsyncCommand(ri->link->cc,
-            sentinelInfoReplyCallback, ri, "%s",
+            sentinelDiscardReplyCallback, ri, "%s",
+            sentinelInstanceMapCommand(ri,"MULTI"));
+        if (retval == C_ERR) return;
+        ri->link->pending_commands++;
+
+        retval = redisAsyncCommand(ri->link->cc,
+            sentinelDiscardReplyCallback, ri, "%s SERVER",
             sentinelInstanceMapCommand(ri,"INFO"));
-        if (retval == C_OK) ri->link->pending_commands++;
+        if (retval == C_ERR) return;
+        ri->link->pending_commands++;
+
+        retval = redisAsyncCommand(ri->link->cc,
+            sentinelDiscardReplyCallback, ri, "%s REPLICATION",
+            sentinelInstanceMapCommand(ri,"INFO"));
+        if (retval == C_ERR) return;
+        ri->link->pending_commands++;
+
+        retval = redisAsyncCommand(ri->link->cc,
+            multiInfoReplyCallback, ri, "%s",
+            sentinelInstanceMapCommand(ri,"EXEC"));
+        if (retval == C_ERR) return;
+        ri->link->pending_commands++;
     }
 
     /* Send PING to all the three kinds of instances. */
